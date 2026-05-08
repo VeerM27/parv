@@ -21,7 +21,7 @@ const TEAMS = {
   },
   MS: {
     name: "Mumbai Strikers",
-    short: "MUMBAISTRIKERS",
+    short: "MUMBAI STRIKERS",
     abbr: "MS",
     primary: "#3B9DFF",
     glow: "rgba(59, 157, 255, 0.45)",
@@ -479,7 +479,7 @@ export default function TournamentApp() {
 
         <div className="hero-eyebrow">3-TEAM ROUND ROBIN</div>
         <h1 className="hero-title">
-          <span className="t-gold">KIDS</span>
+          <span className="t-gold">MANHATTAN KIDS</span>
           <span className="t-white">PREMIER</span>
           <span className="t-purple">LEAGUE</span>
         </h1>
