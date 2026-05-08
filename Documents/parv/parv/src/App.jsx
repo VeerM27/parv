@@ -9,7 +9,7 @@ const ADMIN_SESSION_KEY = "kpl-admin-session";
 const TEAMS = {
   GG: {
     name: "Golden Gladiators",
-    short: "GLADIATORS",
+    short: "GOLDEN GLADIATORS",
     abbr: "GG",
     primary: "#F5B800",
     glow: "rgba(245, 184, 0, 0.45)",
@@ -21,7 +21,7 @@ const TEAMS = {
   },
   MS: {
     name: "Mumbai Strikers",
-    short: "STRIKERS",
+    short: "MUMBAISTRIKERS",
     abbr: "MS",
     primary: "#3B9DFF",
     glow: "rgba(59, 157, 255, 0.45)",
@@ -33,7 +33,7 @@ const TEAMS = {
   },
   MC: {
     name: "Manhattan Challengers",
-    short: "CHALLENGERS",
+    short: "MANHATTAN CHALLENGERS",
     abbr: "MC",
     primary: "#A855F7",
     glow: "rgba(168, 85, 247, 0.45)",
@@ -1155,11 +1155,12 @@ const styles = `
 @import url('https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Rajdhani:wght@400;500;600;700&family=Oswald:wght@500;700&display=swap');
 
 /* ===== FULL SCREEN FIX ===== */
-html, body {
+html, body, #root {
   margin: 0;
   padding: 0;
   width: 100%;
   min-height: 100%;
+  max-width: 100%;
   overflow-x: hidden;
 }
 
