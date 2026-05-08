@@ -448,8 +448,12 @@ export default function TournamentApp() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdminModal, setShowAdminModal] = useState(false);
   const [liveScore, setLiveScore] = useState(null);
-  // Track which updates WE pushed so we don't re-apply our own realtime echo
-  const localRef = useRef({ matches: null, liveScore: null });
+  // Write-lock refs: prevent our own realtime echoes from re-applying state.
+  // String comparison (old approach) fails because Supabase JSONB can reorder keys.
+  const matchesLock = useRef(false);
+  const matchesLockTimer = useRef(null);
+  const liveLock = useRef(false);
+  const liveLockTimer = useRef(null);
 
   // ── Load initial data from Supabase ──────────────────────────────────────
   useEffect(() => {
@@ -474,7 +478,6 @@ export default function TournamentApp() {
         });
       } catch (e) {
         console.error("Supabase load error:", e);
-        // Fallback to localStorage if Supabase is unreachable
         try {
           const r = localStorage.getItem(STORAGE_KEY);
           if (r) {
@@ -502,14 +505,16 @@ export default function TournamentApp() {
         { event: "UPDATE", schema: "public", table: "app_state" },
         ({ new: row }) => {
           if (row.id === "matches") {
-            // Skip if this is our own write echoing back
-            if (localRef.current.matches === JSON.stringify(row.data)) return;
+            if (matchesLock.current) return; // our own echo, skip
             if (Array.isArray(row.data) && row.data.length === 6)
               setMatches(row.data);
           }
           if (row.id === "live_score") {
-            if (localRef.current.liveScore === JSON.stringify(row.data)) return;
-            setLiveScore(row.data);
+            if (liveLock.current) return; // our own echo, skip
+            // Viewers receive score without history (that's fine — undo is admin-only)
+            setLiveScore((prev) =>
+              row.data ? { ...row.data, history: prev?.history || [] } : null,
+            );
           }
         },
       )
@@ -523,37 +528,54 @@ export default function TournamentApp() {
   // ── Persist matches to Supabase whenever they change ────────────────────
   useEffect(() => {
     if (!loaded) return;
-    const payload = JSON.stringify(matches);
-    localRef.current.matches = payload;
+    // Lock for 2s so realtime echo doesn't bounce state back to us
+    matchesLock.current = true;
+    clearTimeout(matchesLockTimer.current);
+    matchesLockTimer.current = setTimeout(() => {
+      matchesLock.current = false;
+    }, 2000);
+
     supabase
       .from("app_state")
       .update({ data: matches, updated_at: new Date().toISOString() })
       .eq("id", "matches")
       .then(({ error }) => {
         if (error) console.error("Save matches error:", error);
-        // Also keep localStorage as offline backup
-        try {
-          localStorage.setItem(STORAGE_KEY, payload);
-        } catch (_) {}
       });
+
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(matches));
+    } catch (_) {}
   }, [matches, loaded]);
 
   // ── Persist liveScore to Supabase whenever it changes ───────────────────
   useEffect(() => {
     if (!loaded) return;
-    const payload = JSON.stringify(liveScore);
-    localRef.current.liveScore = payload;
+    // Lock for 2s so realtime echo doesn't bounce state back to us
+    liveLock.current = true;
+    clearTimeout(liveLockTimer.current);
+    liveLockTimer.current = setTimeout(() => {
+      liveLock.current = false;
+    }, 2000);
+
+    // Strip history — it's large, local-only, and was causing JSONB key-order
+    // mismatches that broke the old string-comparison echo guard.
+    const { history: _h, ...scoreToSave } = liveScore || {};
     supabase
       .from("app_state")
-      .update({ data: liveScore, updated_at: new Date().toISOString() })
+      .update({
+        data: liveScore ? scoreToSave : null,
+        updated_at: new Date().toISOString(),
+      })
       .eq("id", "live_score")
       .then(({ error }) => {
         if (error) console.error("Save live_score error:", error);
-        try {
-          if (liveScore) localStorage.setItem(LIVE_KEY, payload);
-          else localStorage.removeItem(LIVE_KEY);
-        } catch (_) {}
       });
+
+    try {
+      if (liveScore) localStorage.setItem(LIVE_KEY, JSON.stringify(liveScore));
+      else localStorage.removeItem(LIVE_KEY);
+    } catch (_) {}
   }, [liveScore, loaded]);
 
   const standings = useMemo(() => calcStandings(matches), [matches]);
