@@ -115,10 +115,14 @@ const getBallSymbol = (ev) => {
 };
 
 const processBall = (score, event) => {
-  const s = JSON.parse(JSON.stringify(score));
-  s.history = s.history || [];
-  s.history.push(JSON.parse(JSON.stringify(score)));
-  if (s.history.length > 100) s.history = s.history.slice(-100);
+  // Strip history BEFORE cloning. Without this, every ball deep-clones the
+  // entire history array (which grows by 1 each ball), making it O(N²) in
+  // CPU and memory — the root cause of lag and dropped inputs.
+  const { history: prevHistory, ...scoreData } = score;
+  const s = JSON.parse(JSON.stringify(scoreData)); // fast: only clones live data
+
+  // Keep only the last 3 snapshots — enough for undo, tiny memory footprint
+  s.history = [...(prevHistory || []).slice(-2), scoreData];
 
   const isLegal = event.type !== "wide" && event.type !== "noball";
   const batRuns =
@@ -774,15 +778,26 @@ function LiveScoreSection({
     );
   });
 
+  // Always-current ref so fast taps don't read stale React state
+  const liveScoreRef = useRef(liveScore);
+  useEffect(() => {
+    liveScoreRef.current = liveScore;
+  }, [liveScore]);
+
   const handleBall = (event) => {
-    const updated = processBall(liveScore, event);
+    const updated = processBall(liveScoreRef.current, event);
+    liveScoreRef.current = updated; // update immediately so next tap isn't stale
     onUpdate(updated);
     if (updated.pendingAction === "new_bowler") setShowBowlerModal(true);
   };
 
   const handleUndo = () => {
-    if (!liveScore.history || liveScore.history.length === 0) return;
-    onUpdate(liveScore.history[liveScore.history.length - 1]);
+    const cur = liveScoreRef.current;
+    if (!cur.history || cur.history.length === 0) return;
+    const prev = cur.history[cur.history.length - 1];
+    const restored = { ...prev, history: cur.history.slice(0, -1) };
+    liveScoreRef.current = restored;
+    onUpdate(restored);
   };
 
   const handleSetup = ({
