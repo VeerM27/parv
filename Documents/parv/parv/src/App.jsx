@@ -1,4 +1,5 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
+import { supabase } from "./supabase";
 
 const ADMIN_PIN = "27112004@";
 const ADMIN_SESSION_KEY = "kpl-admin-session";
@@ -447,35 +448,112 @@ export default function TournamentApp() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdminModal, setShowAdminModal] = useState(false);
   const [liveScore, setLiveScore] = useState(null);
+  // Track which updates WE pushed so we don't re-apply our own realtime echo
+  const localRef = useRef({ matches: null, liveScore: null });
 
+  // ── Load initial data from Supabase ──────────────────────────────────────
   useEffect(() => {
     if (sessionStorage.getItem(ADMIN_SESSION_KEY) === "1") setIsAdmin(true);
-    try {
-      const r = localStorage.getItem(STORAGE_KEY);
-      if (r) {
-        const p = JSON.parse(r);
-        if (Array.isArray(p) && p.length === 6) setMatches(p);
+
+    const load = async () => {
+      try {
+        const { data, error } = await supabase
+          .from("app_state")
+          .select("id, data")
+          .in("id", ["matches", "live_score"]);
+
+        if (error) throw error;
+
+        data.forEach(({ id, data: val }) => {
+          if (id === "matches" && Array.isArray(val) && val.length === 6) {
+            setMatches(val);
+          }
+          if (id === "live_score") {
+            setLiveScore(val);
+          }
+        });
+      } catch (e) {
+        console.error("Supabase load error:", e);
+        // Fallback to localStorage if Supabase is unreachable
+        try {
+          const r = localStorage.getItem(STORAGE_KEY);
+          if (r) {
+            const p = JSON.parse(r);
+            if (Array.isArray(p) && p.length === 6) setMatches(p);
+          }
+        } catch (_) {}
+        try {
+          const r = localStorage.getItem(LIVE_KEY);
+          if (r) setLiveScore(JSON.parse(r));
+        } catch (_) {}
+      } finally {
+        setLoaded(true);
       }
-    } catch (e) {}
-    try {
-      const r = localStorage.getItem(LIVE_KEY);
-      if (r) setLiveScore(JSON.parse(r));
-    } catch (e) {}
-    setLoaded(true);
+    };
+    load();
   }, []);
 
+  // ── Realtime subscription — updates from other tabs/devices ──────────────
+  useEffect(() => {
+    const channel = supabase
+      .channel("app_state_changes")
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "app_state" },
+        ({ new: row }) => {
+          if (row.id === "matches") {
+            // Skip if this is our own write echoing back
+            if (localRef.current.matches === JSON.stringify(row.data)) return;
+            if (Array.isArray(row.data) && row.data.length === 6)
+              setMatches(row.data);
+          }
+          if (row.id === "live_score") {
+            if (localRef.current.liveScore === JSON.stringify(row.data)) return;
+            setLiveScore(row.data);
+          }
+        },
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // ── Persist matches to Supabase whenever they change ────────────────────
   useEffect(() => {
     if (!loaded) return;
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(matches));
-    } catch (e) {}
+    const payload = JSON.stringify(matches);
+    localRef.current.matches = payload;
+    supabase
+      .from("app_state")
+      .update({ data: matches, updated_at: new Date().toISOString() })
+      .eq("id", "matches")
+      .then(({ error }) => {
+        if (error) console.error("Save matches error:", error);
+        // Also keep localStorage as offline backup
+        try {
+          localStorage.setItem(STORAGE_KEY, payload);
+        } catch (_) {}
+      });
   }, [matches, loaded]);
+
+  // ── Persist liveScore to Supabase whenever it changes ───────────────────
   useEffect(() => {
     if (!loaded) return;
-    try {
-      if (liveScore) localStorage.setItem(LIVE_KEY, JSON.stringify(liveScore));
-      else localStorage.removeItem(LIVE_KEY);
-    } catch (e) {}
+    const payload = JSON.stringify(liveScore);
+    localRef.current.liveScore = payload;
+    supabase
+      .from("app_state")
+      .update({ data: liveScore, updated_at: new Date().toISOString() })
+      .eq("id", "live_score")
+      .then(({ error }) => {
+        if (error) console.error("Save live_score error:", error);
+        try {
+          if (liveScore) localStorage.setItem(LIVE_KEY, payload);
+          else localStorage.removeItem(LIVE_KEY);
+        } catch (_) {}
+      });
   }, [liveScore, loaded]);
 
   const standings = useMemo(() => calcStandings(matches), [matches]);
