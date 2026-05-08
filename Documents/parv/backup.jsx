@@ -76,7 +76,6 @@ const allPlayers = (teamKey) => {
   return [t.captain, t.viceCaptain, ...t.players];
 };
 
-// FIX: added seq: 0 — monotonic counter used to reject stale Supabase echoes
 const initLiveScore = (matchId, battingKey, fieldingKey, totalOvers = 6) => ({
   matchId,
   battingKey,
@@ -103,7 +102,6 @@ const initLiveScore = (matchId, battingKey, fieldingKey, totalOvers = 6) => ({
   pendingAction: "setup",
   overEndedWithWicket: false,
   history: [],
-  seq: 0, // FIX: version counter
 });
 
 const getBallSymbol = (ev) => {
@@ -117,13 +115,14 @@ const getBallSymbol = (ev) => {
 };
 
 const processBall = (score, event) => {
+  // Strip history BEFORE cloning. Without this, every ball deep-clones the
+  // entire history array (which grows by 1 each ball), making it O(N²) in
+  // CPU and memory — the root cause of lag and dropped inputs.
   const { history: prevHistory, ...scoreData } = score;
-  const s = JSON.parse(JSON.stringify(scoreData));
+  const s = JSON.parse(JSON.stringify(scoreData)); // fast: only clones live data
 
+  // Keep only the last 3 snapshots — enough for undo, tiny memory footprint
   s.history = [...(prevHistory || []).slice(-2), scoreData];
-
-  // FIX: increment seq on every ball so realtime listener can reject stale echoes
-  s.seq = (score.seq || 0) + 1;
 
   const isLegal = event.type !== "wide" && event.type !== "noball";
   const batRuns =
@@ -142,6 +141,7 @@ const processBall = (score, event) => {
         : event.runs || 0;
 
   s.runs += totalRunsThisBall;
+  // 2nd innings: check if chasing team reached target immediately
   const targetReached = () =>
     s.innings === 2 && s.target !== null && s.runs >= s.target;
   if (event.type === "wide") s.extras.wides += 1 + (event.extraRuns || 0);
@@ -452,11 +452,14 @@ export default function TournamentApp() {
   const [isAdmin, setIsAdmin] = useState(false);
   const [showAdminModal, setShowAdminModal] = useState(false);
   const [liveScore, setLiveScore] = useState(null);
+  // Write-lock refs: prevent our own realtime echoes from re-applying state.
+  // String comparison (old approach) fails because Supabase JSONB can reorder keys.
   const matchesLock = useRef(false);
   const matchesLockTimer = useRef(null);
   const liveLock = useRef(false);
   const liveLockTimer = useRef(null);
 
+  // ── Load initial data from Supabase ──────────────────────────────────────
   useEffect(() => {
     if (sessionStorage.getItem(ADMIN_SESSION_KEY) === "1") setIsAdmin(true);
 
@@ -497,6 +500,7 @@ export default function TournamentApp() {
     load();
   }, []);
 
+  // ── Realtime subscription — updates from other tabs/devices ──────────────
   useEffect(() => {
     const channel = supabase
       .channel("app_state_changes")
@@ -505,18 +509,16 @@ export default function TournamentApp() {
         { event: "UPDATE", schema: "public", table: "app_state" },
         ({ new: row }) => {
           if (row.id === "matches") {
-            if (matchesLock.current) return;
+            if (matchesLock.current) return; // our own echo, skip
             if (Array.isArray(row.data) && row.data.length === 6)
               setMatches(row.data);
           }
           if (row.id === "live_score") {
-            if (liveLock.current) return;
-            // FIX: reject stale echoes — only apply if incoming seq >= current seq
-            setLiveScore((prev) => {
-              if (!row.data) return null;
-              if ((row.data.seq || 0) < (prev?.seq || 0)) return prev;
-              return { ...row.data, history: prev?.history || [] };
-            });
+            if (liveLock.current) return; // our own echo, skip
+            // Viewers receive score without history (that's fine — undo is admin-only)
+            setLiveScore((prev) =>
+              row.data ? { ...row.data, history: prev?.history || [] } : null,
+            );
           }
         },
       )
@@ -527,14 +529,15 @@ export default function TournamentApp() {
     };
   }, []);
 
+  // ── Persist matches to Supabase whenever they change ────────────────────
   useEffect(() => {
     if (!loaded) return;
+    // Lock for 2s so realtime echo doesn't bounce state back to us
     matchesLock.current = true;
     clearTimeout(matchesLockTimer.current);
-    // FIX: extended from 2000 → 5000ms to cover slow Supabase round-trips
     matchesLockTimer.current = setTimeout(() => {
       matchesLock.current = false;
-    }, 5000);
+    }, 2000);
 
     supabase
       .from("app_state")
@@ -549,15 +552,18 @@ export default function TournamentApp() {
     } catch (_) {}
   }, [matches, loaded]);
 
+  // ── Persist liveScore to Supabase whenever it changes ───────────────────
   useEffect(() => {
     if (!loaded) return;
+    // Lock for 2s so realtime echo doesn't bounce state back to us
     liveLock.current = true;
     clearTimeout(liveLockTimer.current);
-    // FIX: extended from 2000 → 5000ms to cover slow Supabase round-trips
     liveLockTimer.current = setTimeout(() => {
       liveLock.current = false;
-    }, 5000);
+    }, 2000);
 
+    // Strip history — it's large, local-only, and was causing JSONB key-order
+    // mismatches that broke the old string-comparison echo guard.
     const { history: _h, ...scoreToSave } = liveScore || {};
     supabase
       .from("app_state")
@@ -772,20 +778,15 @@ function LiveScoreSection({
     );
   });
 
+  // Always-current ref so fast taps don't read stale React state
   const liveScoreRef = useRef(liveScore);
   useEffect(() => {
     liveScoreRef.current = liveScore;
   }, [liveScore]);
 
-  // FIX: sync showSetup when pendingAction changes (e.g. from realtime update
-  // or after "start 2nd innings" sets pendingAction back to "setup")
-  useEffect(() => {
-    if (liveScore.pendingAction === "setup") setShowSetup(true);
-  }, [liveScore.pendingAction]);
-
   const handleBall = (event) => {
     const updated = processBall(liveScoreRef.current, event);
-    liveScoreRef.current = updated;
+    liveScoreRef.current = updated; // update immediately so next tap isn't stale
     onUpdate(updated);
     if (updated.pendingAction === "new_bowler") setShowBowlerModal(true);
   };
@@ -799,7 +800,6 @@ function LiveScoreSection({
     onUpdate(restored);
   };
 
-  // FIX: use liveScoreRef.current (not stale liveScore prop) and update ref immediately
   const handleSetup = ({
     opener1,
     opener2,
@@ -807,9 +807,8 @@ function LiveScoreSection({
     battingKey,
     totalOvers,
   }) => {
-    const cur = liveScoreRef.current;
-    const updated = {
-      ...cur,
+    onUpdate({
+      ...liveScore,
       battingKey,
       fieldingKey: battingKey === match.a ? match.b : match.a,
       totalOvers,
@@ -823,35 +822,26 @@ function LiveScoreSection({
       bowling: { [bowler]: { overs: 0, balls: 0, runs: 0, wickets: 0 } },
       pendingAction: "ball",
       setup: true,
-      seq: (cur.seq || 0) + 1,
-    };
-    liveScoreRef.current = updated;
-    onUpdate(updated);
+    });
     setShowSetup(false);
   };
 
-  // FIX: use liveScoreRef.current and update ref immediately
   const handleNewBatsman = (name) => {
-    const cur = liveScoreRef.current;
-    const updated = { ...cur, striker: name, seq: (cur.seq || 0) + 1 };
+    const updated = { ...liveScore, striker: name };
     if (!updated.batting[name])
       updated.batting[name] = { runs: 0, balls: 0, fours: 0, sixes: 0 };
     updated.pendingAction = updated.overEndedWithWicket ? "new_bowler" : "ball";
     updated.overEndedWithWicket = false;
-    liveScoreRef.current = updated;
     onUpdate(updated);
     if (updated.pendingAction === "new_bowler") setShowBowlerModal(true);
     setShowWicketModal(false);
   };
 
-  // FIX: use liveScoreRef.current and update ref immediately
   const handleNewBowler = (name) => {
-    const cur = liveScoreRef.current;
-    const updated = { ...cur, currentBowler: name, seq: (cur.seq || 0) + 1 };
+    const updated = { ...liveScore, currentBowler: name };
     if (!updated.bowling[name])
       updated.bowling[name] = { overs: 0, balls: 0, runs: 0, wickets: 0 };
     updated.pendingAction = "ball";
-    liveScoreRef.current = updated;
     onUpdate(updated);
     setShowBowlerModal(false);
   };
@@ -1316,22 +1306,20 @@ function LiveScoreSection({
               {isAdmin && (
                 <button
                   className="btn primary"
-                  // FIX: read from ref so 2nd-innings state is never stale
                   onClick={() => {
-                    const cur = liveScoreRef.current;
                     const fi = {
-                      runs: cur.runs,
-                      wickets: cur.wickets,
-                      completedOvers: cur.completedOvers,
-                      ballsInOver: cur.ballsInOver,
+                      runs: liveScore.runs,
+                      wickets: liveScore.wickets,
+                      completedOvers: liveScore.completedOvers,
+                      ballsInOver: liveScore.ballsInOver,
                     };
-                    const updated = {
-                      ...cur,
+                    onUpdate({
+                      ...liveScore,
                       innings: 2,
                       firstInnings: fi,
-                      target: cur.runs + 1,
-                      battingKey: cur.fieldingKey,
-                      fieldingKey: cur.battingKey,
+                      target: liveScore.runs + 1,
+                      battingKey: liveScore.fieldingKey,
+                      fieldingKey: liveScore.battingKey,
                       runs: 0,
                       wickets: 0,
                       completedOvers: 0,
@@ -1349,10 +1337,7 @@ function LiveScoreSection({
                       pendingAction: "setup",
                       overEndedWithWicket: false,
                       matchResult: null,
-                      seq: (cur.seq || 0) + 1,
-                    };
-                    liveScoreRef.current = updated;
-                    onUpdate(updated);
+                    });
                     setShowSetup(true);
                   }}
                 >
@@ -1470,10 +1455,8 @@ function LiveScoreSection({
           nextBatters={nextBatters}
           bat={bat}
           field={field}
-          // FIX: use liveScoreRef.current so wicket is processed against the
-          // latest state, not whatever liveScore was when the modal opened
           onConfirm={(dismissal, fielder, newBatsman) => {
-            const updated = processBall(liveScoreRef.current, {
+            const updated = processBall(liveScore, {
               type: "wicket",
               runs: 0,
               dismissal,
@@ -1493,7 +1476,6 @@ function LiveScoreSection({
                 : "ball";
               updated.overEndedWithWicket = false;
             }
-            liveScoreRef.current = updated;
             onUpdate(updated);
             setShowWicketModal(false);
             if (updated.pendingAction === "new_bowler")
@@ -1790,7 +1772,6 @@ function BallEntryPanel({ liveScore, onBall, onUndo, bat, field, onWicket }) {
             onClick={() => {
               onBall({ type: "wide", extraRuns: wideExtra });
               setWideExtra(0);
-              setMode("normal"); // FIX: reset mode after logging
             }}
           >
             LOG WIDE{wideExtra > 0 ? ` (+${wideExtra})` : ""}
@@ -1817,7 +1798,6 @@ function BallEntryPanel({ liveScore, onBall, onUndo, bat, field, onWicket }) {
             onClick={() => {
               onBall({ type: "noball", runs: nbRuns });
               setNbRuns(0);
-              setMode("normal"); // FIX: reset mode after logging
             }}
           >
             LOG NO-BALL{nbRuns > 0 ? ` (+${nbRuns})` : ""}
